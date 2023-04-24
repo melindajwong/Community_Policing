@@ -1,0 +1,1266 @@
+---
+title: "Virginia Community Policing"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: 
+      version: 4
+      bootswatch: lux
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# ..................................................
+# Load packages ----
+
+library(flexdashboard)
+library(tidyverse)
+library(leaflet)
+library(janitor)
+library(ggplot2)
+library(sf)
+library(tigris)
+library(dplyr)
+library(rcartocolor)
+library(shiny)
+library(shinyWidgets)
+library(shinyBS)
+library(reactable)
+library(htmltools)
+library(plotly)
+
+options(tigris_use_cache = TRUE) 
+
+
+# ..................................................
+# Read data ----
+race <- read_csv('data/race_per.csv')
+stops <- read_csv('data/stops.csv')
+va_counties <- counties(state = "51", cb = TRUE)
+va_counties$GEOID <- as.numeric(va_counties$GEOID)
+
+# Define functions ----
+
+## Sunburst for Outcomes
+as.sunburstDF <- function(DF, value_column = NULL, add_root = FALSE){
+  require(data.table)
+  
+  colNamesDF <- names(DF)
+  
+  if(is.data.table(DF)){
+    DT <- copy(DF)
+  } else {
+    DT <- data.table(DF, stringsAsFactors = FALSE)
+  }
+  
+  if(add_root){
+    DT[, root := "Total"]  
+  }
+  
+  colNamesDT <- names(DT)
+  hierarchy_columns <- setdiff(colNamesDT, value_column)
+  DT[, (hierarchy_columns) := lapply(.SD, as.factor), .SDcols = hierarchy_columns]
+  
+  if(is.null(value_column) && add_root){
+    setcolorder(DT, c("root", colNamesDF))
+  } else if(!is.null(value_column) && !add_root) {
+    setnames(DT, value_column, "values", skip_absent=TRUE)
+    setcolorder(DT, c(setdiff(colNamesDF, value_column), "values"))
+  } else if(!is.null(value_column) && add_root) {
+    setnames(DT, value_column, "values", skip_absent=TRUE)
+    setcolorder(DT, c("root", setdiff(colNamesDF, value_column), "values"))
+  }
+  
+  hierarchyList <- list()
+  
+  for(i in seq_along(hierarchy_columns)){
+    current_columns <- colNamesDT[1:i]
+    if(is.null(value_column)){
+      currentDT <- unique(DT[, ..current_columns][, values := .N, by = current_columns], by = current_columns)
+    } else {
+      currentDT <- DT[, lapply(.SD, sum, na.rm = TRUE), by=current_columns, .SDcols = "values"]
+    }
+    setnames(currentDT, length(current_columns), "labels")
+    hierarchyList[[i]] <- currentDT
+  }
+  
+  hierarchyDT <- rbindlist(hierarchyList, use.names = TRUE, fill = TRUE)
+  
+  parent_columns <- setdiff(names(hierarchyDT), c("labels", "values", value_column))
+  hierarchyDT[, parents := apply(.SD, 1, function(x){fifelse(all(is.na(x)), yes = NA_character_, no = paste(x[!is.na(x)], sep = ":", collapse = " - "))}), .SDcols = parent_columns]
+  hierarchyDT[, ids := apply(.SD, 1, function(x){paste(x[!is.na(x)], collapse = " - ")}), .SDcols = c("parents", "labels")]
+  hierarchyDT[, c(parent_columns) := NULL]
+  return(hierarchyDT)
+}
+
+```
+
+# Introduction {data-orientation="rows"}
+
+## Quick Stats: Overall
+
+### Stops
+
+```{r, echo=FALSE}
+total_stops <- sum(stops$total_count)
+valueBox(total_stops, caption= "total stops in the dataset", icon="fa-hand-paper")
+```
+
+### Arrests
+
+```{r, echo=FALSE}
+outcome <- stops %>% 
+  group_by(action_taken) %>% 
+  summarise(total_count=n())
+percent_arrest <- round(subset(outcome, action_taken=="ARREST")$total_count / sum(outcome$total_count) *100,  digits=1)
+valueBox(percent_arrest, caption= "percent of stops resulting in an arrest", icon='fa-percentage')
+```
+
+### Violations
+
+```{r, echo=FALSE}
+reason <- stops %>% 
+  group_by(reason_for_stop) %>% 
+  summarise(total_count=n())
+percent_traffic <- round(subset(reason, reason_for_stop=="TRAFFIC VIOLATION")$total_count / sum(reason$total_count) *100,  digits=1)
+valueBox(percent_traffic, caption= "percent of stops stemming from a traffic violation", icon='fa-percentage')
+```
+
+## About intro
+
+### About the Data
+
+HB1250, the *"Community Policing Act; data collection and reporting requirement"* was signed into law on April 11th, 2020. The Act requires law-enforcement officers to collect and publicly report police stop incidents. For every stop, the officer needs to document the demographic information of the person stopped, reason for the stop, location, outcome of the stop, and whether a vehicle or person was searched. The data is shared publicly via the [Virginia Community Policing Open Data Portal](https://data.virginia.gov/stories/s/Virginia-Community-Policing-Act-Data-Collection/rden-cz3h/).
+
+### Key Questions
+
+The Virginia Community Policing Open Data Portal contains a lot of information that can be analyzed and visually represented in different ways. The data is collected at the county level, so we break down our observations by county. Based on our research and backgrounds, we were most interested in asking three questions:
+
+1.  Given the history of racist discrimination towards Black people by police, are Black people stopped at higher or lower rates than other racial groups? How does this differ by county?
+2.  How do outcomes of stops differ by race? How does this differ across counties?
+3.  In 2021, the D.C. government explained in their community policing report that racial disparities in police stops in the District were due to non-residents. Are racial disparities different by residency status?
+
+## Race on Stops {data-height="100"}
+
+#### Race on Stops
+
+This is text. Elaborate.
+
+## Race on Outcomes of Stops {data-height="100"}
+
+#### Race on Outcomes of Stops
+
+
+# Race Overview {data-navmenu="Race"}
+
+## Inputs {.sidebar}
+
+### Selections
+
+```{r, echo=FALSE}
+loc_choices <- unique(race$NAME)
+selectInput(
+  'loc_sels', 
+  label = 'Locality', 
+  choices = loc_choices,
+  selected = 'Albemarle County, Virginia')
+```
+
+## Introduction Paragraphs {data-height="300"}
+
+#### Introduction
+
+Virginia is a state located in the southeastern region of the United States with a population of over 8 million people. Racial diversity is a defining characteristic of Virginia, with a wide range of ethnic and racial groups residing in the state. According to the United States Census Bureau, the most recent data available from the 2020 dicennial census estimates that Virginia's population is 60.4% white, 18.6% black or African American, 0.5% American Indian and Alaska Native, 7.21% Asian, Native Hawaiian, or Pacific Islander, 5.2% some other race alone, and 8.2% two or more races. (see About section for more details). [An analysis of 2020 census data across the U.S. by wallethub](https://wallethub.com/edu/most-least-diverse-states-in-america/38262) found that Virginia ranked 14th in racial and ethnic diversity, ranking below it's neighbor Maryland which was ranked 5th but above it's neighbor West Virginia which was ranked 48th.
+
+When examining the racial demographics of Virginia's counties, there is considerable variation across the state. For example, Highland County along the West Virginia Border is 99.4% white, Petersburg City just south of Richmond in Southeast Virginia is 80.7% black or African American, and Loudoun County, a suburb of Washington, D.C. is 25.9% Asian or Pacific Islander.The complex racial makeup of Virginia and its counties reflects the state's history and ongoing demographic changes.
+
+## Statewide {data-height="50"}
+
+#### Statewide Comparisons
+
+## Maps of Racial Groups {.tabset}
+
+### White
+
+```{r, echo=FALSE}
+# Creates dataframe with race and geography data
+race_geo <- va_counties %>%
+  left_join(race, by = c("GEOID" = "GEOID"))
+
+pal <- colorNumeric(carto_pal(7, "PurpOr"), 
+                    reverse = FALSE, 
+                    domain = race_geo$'WHITE') 
+
+  # Creates map
+  race_white <- leaflet() %>% 
+   addProviderTiles("CartoDB.Positron") %>% 
+   addPolygons(data = race_geo,
+                fillColor = ~pal(race_geo$'WHITE'),
+                fillOpacity = 0.8,
+                weight = 2, 
+                opacity = 1,
+                color = "white",
+                highlight = highlightOptions(
+                  weight = 3,
+                  fillOpacity = 0.9,
+                  bringToFront = T),
+                popup = paste0("Locality: ", race_geo$NAMELSAD, "<br>",
+                               "Percent White: ", round(race_geo$'WHITE', 3)*100)) %>%
+    addLegend("topright", pal = pal, values = race_geo$'WHITE',
+              title = "Percent White", opacity = 0.7)
+  setView(race_white, -78.476677, 38.029305, zoom= 7)
+  race_white
+```
+
+### Black
+
+```{r, echo=FALSE}
+ # Creates color grading
+  pal <- colorNumeric(carto_pal(7, "PurpOr"), 
+                    reverse = FALSE, 
+                    domain = race_geo$'BLACK OR AFRICAN AMERICAN') 
+
+  # Creates map
+  race_black <- leaflet() %>% 
+   addProviderTiles("CartoDB.Positron") %>% 
+   addPolygons(data = race_geo,
+                fillColor = ~pal(race_geo$'BLACK OR AFRICAN AMERICAN'),
+                fillOpacity = 0.8,
+                weight = 2, 
+                opacity = 1,
+                color = "white",
+                highlight = highlightOptions(
+                  weight = 3,
+                  fillOpacity = 0.9,
+                  bringToFront = T),
+                popup = paste0("Locality: ", race_geo$NAMELSAD, "<br>",
+                               "Percent Black: ", round(race_geo$'BLACK OR AFRICAN AMERICAN', 3)*100)) %>%
+    addLegend("topright", pal = pal, values = race_geo$'BLACK OR AFRICAN AMERICAN',
+              title = "Percent Black", opacity = 0.7)
+  setView(race_black, -78.476677, 38.029305, zoom= 7)
+  race_black
+```
+
+### Asian or Pacific Islander
+
+```{r, echo=FALSE}
+ # Creates color grading
+  pal <- colorNumeric(carto_pal(7, "PurpOr"), 
+                    reverse = FALSE, 
+                    domain = race_geo$'ASIAN OR PACIFIC ISLANDER') 
+
+  # Creates map
+  race_asian <- leaflet() %>% 
+   addProviderTiles("CartoDB.Positron") %>% 
+   addPolygons(data = race_geo,
+                fillColor = ~pal(race_geo$'ASIAN OR PACIFIC ISLANDER'),
+                fillOpacity = 0.8,
+                weight = 2, 
+                opacity = 1,
+                color = "white",
+                highlight = highlightOptions(
+                  weight = 3,
+                  fillOpacity = 0.9,
+                  bringToFront = T),
+                popup = paste0("Locality: ", race_geo$NAMELSAD, "<br>",
+                               "Percent Asian: ", round(race_geo$'ASIAN OR PACIFIC ISLANDER', 3)*100)) %>%
+    addLegend("topright", pal = pal, values = race_geo$'ASIAN OR PACIFIC ISLANDER',
+              title = "Percent Asian", opacity = 0.7)
+  setView(race_asian, -78.476677, 38.029305, zoom= 7)
+  race_asian
+```
+
+### American Indian
+
+```{r, echo=FALSE}
+ # Creates color grading
+  pal <- colorNumeric(carto_pal(7, "PurpOr"), 
+                    reverse = FALSE, 
+                    domain = race_geo$'AMERICAN INDIAN') 
+
+  # Creates map
+  race_native <- leaflet() %>% 
+   addProviderTiles("CartoDB.Positron") %>% 
+   addPolygons(data = race_geo,
+                fillColor = ~pal(race_geo$'AMERICAN INDIAN'),
+                fillOpacity = 0.8,
+                weight = 2, 
+                opacity = 1,
+                color = "white",
+                highlight = highlightOptions(
+                  weight = 3,
+                  fillOpacity = 0.9,
+                  bringToFront = T),
+                popup = paste0("Locality: ", race_geo$NAMELSAD, "<br>",
+                               "Percent American Indian: ", round(race_geo$'AMERICAN INDIAN', 3)*100)) %>%
+    addLegend("topright", pal = pal, values = race_geo$'AMERICAN INDIAN',
+              title = "Percent American Indian", opacity = 0.7)
+  setView(race_native, -78.476677, 38.029305, zoom= 7)
+  race_native
+```
+
+## Locality Selection {data-height="100"}
+
+#### Locality Information
+
+```{r, echo=FALSE}
+selections_output = renderText({
+  paste("You have selected information on individuals in ", input$loc_sels)
+})
+selections_output
+```
+
+## Locality Data
+
+### Locality Race Graph
+
+```{r, echo=FALSE}
+race_choices <- c("AMERICAN INDIAN",
+              "ASIAN OR PACIFIC ISLANDER",
+              "BLACK OR AFRICAN AMERICAN",
+              "WHITE")
+
+avg_race <- colMeans(race[race_choices]) %>% 
+  tibble() %>% 
+  cbind(race_choices) %>% 
+  cbind(rep("Virginia", 4))
+colnames(avg_race) <- c("Percent", "Race", "Locality")
+
+loc_race <- renderPlot({
+  race_loc <- race %>% 
+    filter(NAME == input$loc_sels) %>% 
+    pivot_longer(cols=race_choices)
+  colnames(race_loc) <- c("GEOID", "Locality", "Race", "Percent")
+  race_loc <- race_loc %>% 
+    select(c("Percent", "Race", "Locality")) %>% 
+    rbind(avg_race)
+  
+  loc_race_plot <- ggplot(race_loc, aes(fill=Race, x=Locality, y=Percent)) +
+    geom_bar(position = "stack", stat='identity') +
+    scale_color_brewer(palette = "Blues") +
+    labs(x ="Locality",
+         y="Percentage")
+  return(loc_race_plot)
+})
+
+loc_race
+```
+
+### Locality Race Table
+
+```{r, echo=FALSE}
+loc_race_table <- renderReactable({
+  race_rounded <- race %>% 
+    mutate_if(is.numeric, round, 3)
+  loc_row <- race_rounded[race_rounded$NAME==input$loc_sels,]
+  race_rounded <- race_rounded[!(race_rounded$NAME %in% c(input$loc_sels)),]
+  race_rounded <- rbind(loc_row, race_rounded)
+  
+  reactable(race_rounded[2:6],
+            defaultColDef = colDef(
+              format = colFormat(percent=TRUE),
+              minWidth = 70,
+              headerStyle = list(background = "#f7f7f8")),
+            rowStyle = function(index)
+              if(index ==1 ) list(background = "#FEE7AA"),
+            columns = list(
+              NAME = colDef(format = colFormat(percent=FALSE))
+            ),
+            showSortable = TRUE, 
+            filterable = TRUE,
+            bordered = TRUE,
+            highlight = TRUE)
+})
+
+loc_race_table
+```
+
+# Race on Stops {data-navmenu="Race"}
+
+## Inputs {.sidebar}
+
+### <br> Selections
+
+```{r, echo=FALSE}
+radioButtons(
+  "race_selection",
+  label = tags$span("Race",
+                    bsButton(inputId = "race_stops_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")),
+  choices = race_choices,
+  selected='BLACK OR AFRICAN AMERICAN')
+
+race_stops_modal <- reactive({
+  observeEvent(input$race_stops_q, {
+      showModal(modalDialog(
+        title = "Race Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+race_stops_modal
+```
+
+```{r, echo=FALSE}
+residency_choices <- c("RESIDENT OF JURISDICTION OF STOP",
+                       "OTHER VIRGINIA JURISDICTION RESIDENT",
+                       "OUT OF STATE RESIDENT")
+checkboxGroupInput(
+  'res_selection', 
+  label = tags$span("Residency Status",
+                    bsButton(inputId = "res_stops_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")), 
+  choices = residency_choices,
+  selected = residency_choices
+)
+
+res_stops_modal <- reactive({
+  observeEvent(input$res_stops_q, {
+      showModal(modalDialog(
+        title = "Residency Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+res_stops_modal
+  
+res_stops_alert <- reactive({
+    if(length(input$res_selection) == 0){
+      show_alert(
+        title = "Error!",
+      text = "Please select at least one residency status",
+      type = "error"
+      )
+    }
+  })
+res_stops_alert
+```
+
+```{r, echo=FALSE}
+year_choices <- c(2021, 2022)
+checkboxGroupInput(
+  'year_selection', 
+  label = tags$span("Year",
+                    bsButton(inputId = "year_stops_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")), 
+  choices = year_choices,
+  selected = year_choices)
+
+year_stops_modal <- reactive({
+  observeEvent(input$year_stops_q, {
+      showModal(modalDialog(
+        title = "Year Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+year_stops_modal
+
+year_stops_alert <- reactive({
+    if(length(input$year_selection) == 0){
+      show_alert(
+        title = "Error!",
+      text = "Please select at least one year",
+      type = "error"
+      )
+    }
+  })
+year_stops_alert
+```
+
+```{r, echo=FALSE}
+locality_choices <- unique(stops$locality)
+selectInput(
+  'loc_selection', 
+  label = tags$span("Locality",
+                    bsButton(inputId = "loc_stops_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")),
+  choices = locality_choices,
+  selected = 'Albemarle County')
+
+loc_stops_modal <- reactive({
+  observeEvent(input$loc_stops_q, {
+      showModal(modalDialog(
+        title = "Locality Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+loc_stops_modal
+```
+
+METHODS NOTE: individuals with an unknown race were all removed from the data set to prevent a misrepresentation of the data which was 3.9% of all stops. Additionally, census data categorized two or more races and differentiated between Asian and Pacific Islander/Native Hawaiian while the community policing data did not. Individuals who selected two or more groups were removed and the groups Asian and Pacific Islander/Native Hawaiian were combined. See 'about' section for more details.
+
+## Outputs {data-height="300"}
+
+#### Introduction
+
+These visualizations aim to allow you to compare the demographic makeup of each locality with the demographics of people within that locality who were stopped by the police in a clear, accessible, and customizable manner to make it easy to identify patterns and trends. For example, in some localities, the demographics of those who are stopped by police closely match the overall demographics of the state's population, while in others, there are significant disparities. By analyzing this data, you can identify potential areas where systemic biases may be present in policing practices.
+
+It is important to note that the purpose of this data is not to confirm or deny any racial biases that may be present in policing. Rather, it is meant to provide an accurate representation of the existing data on police stops and demographics. This information can then be used to inform further research and discussions on issues related to policing, race, and equity. By understanding the data that exists, we can work towards developing evidence-based solutions to address systemic issues in policing and promote greater equity and justice for all.
+
+Sources: [Virginia Community Policing Open Data Portal](https://data.virginia.gov/stories/s/Virginia-Community-Policing-Act-Data-Collection/rden-cz3h/) and the [2020 U.S. Census](https://data.census.gov/)
+
+## Header {data-height="50"}
+
+#### Statewide Comparisons
+
+## Map showing disparities
+
+### Disparity between stops and population by race
+
+```{r, echo=FALSE}
+# Create filtered dataframe based on the side bar selection and visualizes in a map
+race_disparity_df <- reactive({
+  # Filter based on selected residency and race, create total for residency column and percent for race column
+  stops_race <- stops %>%
+  filter(residency %in% as.vector(input$res_selection)) %>%
+  filter(year %in% as.vector(input$year_selection)) %>%
+  group_by(across(c('locality', 'race'))) %>%
+  summarise(total_count=n()) %>%
+  pivot_wider(names_from=race, values_from=total_count)  %>%
+  replace(is.na(.), 0)  %>%
+  mutate(total = rowSums(across(where(is.numeric)))) %>%
+  select(c(locality, input$race_selection, total)) %>%
+  rename('race'=2) %>%
+  mutate(per_race = race/total*100)
+
+  # Filter census data to only race needed
+  race_filtered <- race %>%
+   select('GEOID', input$race_selection) %>%
+    rename('pop_data' = 2)
+
+  # Join geometry, census, and police stops data
+  va_counties_stops <- va_counties %>%
+  left_join(stops_race, by = c("NAMELSAD" = "locality")) %>%
+  select(c('GEOID', 'NAMELSAD', 'race', 'total', 'per_race')) %>%
+  left_join(race_filtered, by="GEOID", "GEOID") %>%
+  mutate(pop_data = pop_data*100) %>% 
+  mutate(disparity = per_race-pop_data) %>%
+  st_transform(4326) 
+
+  return(va_counties_stops)
+})
+
+race_disparity_plot <- renderLeaflet({
+  # Creates color grading
+  pal <- colorNumeric(carto_pal(7, "Fall"),
+                    reverse = FALSE,
+                    domain = race_disparity_df()$disparity)
+
+  # Creates map
+  race_disparity <- leaflet() %>%
+   addProviderTiles("CartoDB.Positron") %>%
+   addPolygons(data = race_disparity_df(),
+                fillColor = ~pal(disparity),
+                fillOpacity = 0.8,
+                weight = 2,
+                opacity = 1,
+                color = "white",
+                highlight = highlightOptions(
+                  weight = 3,
+                  fillOpacity = 0.9,
+                  bringToFront = T),
+                popup = paste0("Locality: ", race_disparity_df()$NAMELSAD, "<br>",
+                               "Disparity: ", round(race_disparity_df()$disparity, 1), "<br>",
+                               "% of stops are selected race: ", round(race_disparity_df()$per_race, 1), "<br>",
+                               "% of residents are selected race: ", round(race_disparity_df()$pop_data, 1)))%>%
+    addLegend("topright", pal = pal, values = race_disparity_df()$disparity,
+              title = "Disparity", opacity = 0.7)
+  return (race_disparity)
+})
+
+race_disparity_plot
+
+```
+
+## Commentary on disparities
+
+### Disparities in Police Stops
+
+Disparity is a measure of difference between the percentage of all stops in a locality of one race and the percentage of people residing in that locality of that race. Disproportionate representation could reflect underlying negative racial biases about police officers.
+
+**A negative disparity means that that race is disproportionately less represented in police stops while a positive disparity means that race is disproportionately more represented.** There are many things that go into creating disparities in who the police interact with, including:
+
+-   Explicit or implicit racial bias
+-   Higher police presence in minority neighborhoods
+-   Socioeconomic status
+
+Washington, D.C. has a law similar to the Virginia Community Policing Act that mandates the collection of police data in the District. In response to 2020 and 2021 reports published by the ACLU showing that black residents were more likely to be stopped by MPD, the D.C. government released their own report claiming that because nearly 70% of traffic stops were of residents from outside of the District, that racial disparities were inflated in the report. *Yet, this data shows that racial disparities persist regardless of residency*.
+
+## Highest and Lowest {data-height="525"}
+
+### Greatest disparities
+
+```{r, echo=FALSE}
+# Render a bar chart with positive and negative values
+bar_chart_pos_neg <- function(label, value, max_value = 58, height = "1rem", pos_fill = "#ca562c", neg_fill = "#3d5941") {
+  neg_chart <- div(style = list(flex = "1 1 0"))
+  pos_chart <- div(style = list(flex = "1 1 0"))
+  width <- paste0(abs(value / max_value) * 100, "%")
+
+  if (value < 0) {
+    bar <- div(style = list(marginLeft = "0.5rem", background = neg_fill, width = width, height = height))
+    chart <- div(
+      style = list(display = "flex", alignItems = "center", justifyContent = "flex-end"),
+      label,
+      bar
+    )
+    neg_chart <- tagAppendChild(neg_chart, chart)
+  } else {
+    bar <- div(style = list(marginRight = "0.5rem", background = pos_fill, width = width, height = height))
+    chart <- div(style = list(display = "flex", alignItems = "center"), bar, label)
+    pos_chart <- tagAppendChild(pos_chart, chart)
+  }
+
+  div(style = list(display = "flex"), neg_chart, pos_chart)
+}
+
+# Subset data to top 5 and bottom 5
+disparity_df <- reactive({
+  data_df_sorted <- race_disparity_df()[order(-race_disparity_df()$disparity),] %>% 
+    na.omit()
+  data_df_head <- head(data_df_sorted, 5)
+  data_df_tail <- tail(data_df_sorted, 5)
+  data_df <- rbind(data_df_head, data_df_tail) %>%
+    rbind(data_df_sorted[6:nrow(data_df_sorted)-5,]) %>% 
+    as_tibble() %>%
+    select(c("NAMELSAD", "disparity", "per_race", "pop_data")) %>%
+    mutate_if(is.numeric, round, 1)
+  return(data_df)
+})
+
+#Create reactable with bar chart
+testing <- renderReactable({
+  reactable(
+    disparity_df(),
+    defaultColDef = colDef(
+              headerStyle = list(background = "#f7f7f8")),
+    columns = list(
+      NAMELSAD = colDef(name = "Locality", minWidth = 100),
+      disparity = colDef(
+        name = "Disparity",
+        defaultSortOrder = "desc",
+        cell = function(value) {
+          label <- paste0(round(value, 1), "%")
+          bar_chart_pos_neg(label, value)
+          },
+          align = "center",
+          minWidth = 400),
+      per_race = colDef(name = "Stops Race",
+                        format = colFormat(suffix = "%")),
+      pop_data = colDef(name = "Population Race",
+                        format = colFormat(suffix = "%"))),
+    showSortable = TRUE,
+    filterable = TRUE,
+    bordered = TRUE,
+    highlight = TRUE
+    )
+})
+testing
+```
+
+## Row {data-height="100"}
+
+#### Locality Data
+
+```{r, echo=FALSE}
+selections_output = renderText({
+  res_sel <- paste(input$res_selection, collapse = ', ')
+  year_sel <- paste(input$year_selection, collapse = ' and ')
+  paste("You have selected information on stops of ", tolower(input$race_selection), " individuals in ", input$loc_selection, " who are ", tolower(res_sel), " in ", year_sel)
+})
+selections_output
+```
+
+## Quick Stats: Percentages
+
+### Stops in Locality
+
+```{r, echo=FALSE}
+loc_race_df <- reactive({
+   loc_race_data <- race_disparity_df() %>%
+   filter(NAMELSAD == input$loc_selection) 
+   return(loc_race_data) 
+}) 
+  
+loc_stop_race <- renderValueBox({
+  loc_stop_race_plot <- valueBox(round(loc_race_df()$per_race, digits=1),
+           caption= "Percent of Stops that were Selected Race",
+           icon='fa-percentage')
+  return(loc_stop_race_plot)
+})
+loc_stop_race
+```
+
+### Disparity in Locality
+
+```{r}
+loc_race_dis <- renderValueBox({
+  loc_race_dis_plot <- valueBox(round(loc_race_df()$disparity, digits=1),
+           caption= "Disparity",
+           icon='fa-percentage',
+           color='black')
+  return(loc_race_dis_plot)
+})
+loc_race_dis
+```
+
+### Population in Locality
+
+```{r}
+loc_race_pop <- renderValueBox({
+  loc_race_pop_plot <- valueBox(round(loc_race_df()$pop_data, digits=1),
+           caption= "Percent of Locality that is Selected Race",
+           icon='fa-percentage')
+  return(loc_race_pop_plot)
+})
+loc_race_pop
+```
+
+## Stacked Barchart
+
+### Stops vs population data by selected race in selected locality
+
+```{r, echo=FALSE}
+loc_race_stop <- renderPlot({
+  data <- data.frame(Percentage = c(loc_race_df()$per_race, 100-loc_race_df()$per_race,
+                     loc_race_df()$pop_data, 100-loc_race_df()$pop_data),
+                     Race = c('Selected race', 'All other', 'Selected race', 'All other'),
+                     Data = c('Stops', 'Stops', 'Population','Population'))
+  loc_race_stop_plot <- ggplot(data, aes(fill=Race, x=Data, y=Percentage)) +
+     geom_bar(position='stack', stat='identity') +
+    theme_minimal() +
+    scale_fill_manual(values=c('gray', 'cadetblue4'))
+  return(loc_race_stop_plot)
+})
+
+loc_race_stop
+```
+
+## Quick Stats: Counts
+
+### Selected stops by locality
+
+```{r}
+loc_stop_tot <- renderValueBox({
+  loc_stop_tot_plot <- valueBox(loc_race_df()$race,
+           caption= "Recorded Stops across Selected Race in the Jurisdiction")
+  return(loc_stop_tot_plot)
+})
+loc_stop_tot
+```
+
+### Total stops by locality
+
+```{r}
+loc_stop_tot <- renderValueBox({
+  loc_stop_tot_plot <- valueBox(loc_race_df()$total,
+           caption= "Recorded Stops across all Races in the Jurisdiction")
+  return(loc_stop_tot_plot)
+})
+loc_stop_tot
+```
+
+# Race on Outcome {data-navmenu="Race"}
+
+## Inputs {.sidebar}
+
+### <br> Selections
+
+```{r, echo=FALSE}
+radioButtons(
+  "race_selections",
+  label = tags$span("Race",
+                    bsButton(inputId = "race_out_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")),
+  choices = race_choices,
+  selected='BLACK OR AFRICAN AMERICAN'
+)
+
+race_out_modal <- reactive({
+  observeEvent(input$race_out_q, {
+      showModal(modalDialog(
+        title = "Race Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+race_out_modal
+```
+
+```{r, echo=FALSE}
+
+checkboxGroupInput(
+  'res_selections',
+  label = tags$span("Residency",
+                    bsButton(inputId = "res_out_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")),
+  choices = residency_choices,
+  selected = residency_choices
+)
+
+res_out_modal <- reactive({
+  observeEvent(input$res_out_q, {
+      showModal(modalDialog(
+        title = "Residency Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+res_out_modal
+
+res_stops_alert <- reactive({
+    if(length(input$res_selections) == 0){
+      show_alert(
+        title = "Error!",
+      text = "Please select at least one residency status",
+      type = "error"
+      )
+    }
+  })
+res_stops_alert
+```
+
+```{r, echo=FALSE}
+year_choices <- c(2021, 2022)
+checkboxGroupInput(
+  'year_selections', 
+  label = tags$span("Year",
+                    bsButton(inputId = "year_out_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")), 
+  choices = year_choices,
+  selected = year_choices)
+
+year_out_modal <- reactive({
+  observeEvent(input$year_out_q, {
+      showModal(modalDialog(
+        title = "Year Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+year_out_modal
+
+year_outcome_alert <- reactive({
+    if(length(input$year_selections) == 0){
+      show_alert(
+        title = "Error!",
+      text = "Please select at least one year",
+      type = "error"
+      )
+    }
+  })
+year_outcome_alert
+```
+
+```{r, echo=FALSE}
+outcome_choices <- c('NO ENFORCEMENT ACTION',
+                    'WARNING',
+                    'CITATION OR SUMMONS',
+                    'ARREST')
+selectInput(
+  'outcome_sels', 
+  label = tags$span("Outcome of Stop",
+                    bsButton(inputId = "out_out_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")), 
+  choices = outcome_choices,
+  selected = 'ARREST')
+
+out_out_modal <- reactive({
+  observeEvent(input$out_out_q, {
+      showModal(modalDialog(
+        title = "Outcome Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+out_out_modal
+```
+
+```{r, echo=FALSE}
+locality_choices <- unique(stops$locality)
+selectInput(
+  'loc_selections',
+  label = tags$span("Locality",
+                    bsButton(inputId = "loc_out_q",
+                           label = "?",
+                           style = "color: #808080",
+                           size = "extra-small")),
+  choices = locality_choices,
+  selected = 'Albemarle County')
+
+loc_out_modal <- reactive({
+  observeEvent(input$loc_out_q, {
+      showModal(modalDialog(
+        title = "Locality Selection",
+        "Explanation",
+        easyClose = TRUE
+      ))
+  })
+})
+loc_out_modal
+```
+
+METHODS NOTE: individuals with an unknown race were all removed from the data set to prevent skewing the percentages. Additionally, census data categorizes two or more races and differentiates between Asian and Pacific Islander/Native Hawaiian while the community policing data did not. Individuals who selected two or more groups remained in the calculations for percentage of each race and the groups Asian and Pacific Islander/Native Hawaiian were combined. See 'about' section for more details.
+
+## Introduction Header {data-height="425"}
+
+#### Introduction
+
+Going beyond differences in what races are stopped, we wanted to see what was the outcome of police stops by race.
+
+Types of Stop outcomes:
+
+-   No Enforcement Action: The law enforcement officer did not use an enforcement action, like a warning, citation, summons, or arrest
+
+-   Citation or Summons: The law enforcement officer served a fine or ordered the driver to attend court for stop.
+
+-   Warning: The law enforcement officer warned the driver not to repeat the violation.
+
+-   Arrest: The officer arrested the individual.
+
+Outcome disparity is a measure of difference between the percentage of all stops in a locality of one race and the percentage of all stops resulting in the selected outcome in the locality of that race. In other words, it is measuring whether that racial group is over- or under- represented within that group of outcomes.
+
+*A negative disparity (green) means that that race is underrepresented in that outcome type relative to that the percentage of all stops of that race while a positive disparity (red) means that race is over represented relative to the percentage of all stops for that race.*
+
+Sources: [Virginia Community Policing Open Data Portal](https://data.virginia.gov/stories/s/Virginia-Community-Policing-Act-Data-Collection/rden-cz3h/) and the [2020 U.S. Census](https://data.census.gov/)
+
+## Statewide {data-height="50"}
+
+#### Statewide Comparisons
+
+## Map
+
+### Mapping disparities in outcome of stops
+
+```{r, echo=FALSE}
+# Create filtered dataframe based on the residency
+race_outcome_df <- reactive({
+  # Filter based on selected residency and outcome
+  stops_outcome <- stops %>%
+  filter(residency %in% as.vector(input$res_selections)) %>% 
+  filter(action_taken == input$outcome_sels) %>% 
+  filter(year %in% as.vector(input$year_selections)) %>% 
+  group_by(across(c('locality', 'race'))) %>% 
+  summarise(total_count=n()) %>%
+  pivot_wider(names_from=race, values_from=total_count)  %>%
+  replace(is.na(.), 0) %>% 
+  adorn_percentages() %>% 
+  select(c(locality, input$race_selections)) %>% 
+  rename('race_outcome'= 2)
+  stops_outcome$race_outcome <- stops_outcome$race_outcome * 100
+  
+  stops_race2 <- stops %>%
+      filter(residency %in% as.vector(input$res_selections)) %>%
+      group_by(across(c('locality', 'race'))) %>%
+      summarise(total_count=n()) %>%
+      pivot_wider(names_from=race, values_from=total_count)  %>%
+      replace(is.na(.), 0) %>%
+      adorn_percentages() %>% 
+      select(c(locality, input$race_selections)) %>% 
+      rename('race_stops' = 2)
+  stops_race2$race_stops <- stops_race2$race_stops*100
+  
+  race_outcomes <- va_counties %>% 
+    left_join(stops_race2, by= c("NAMELSAD"="locality")) %>% 
+    select('NAMELSAD', 'race_stops') %>% 
+    left_join(stops_outcome, by=c("NAMELSAD"="locality")) %>% 
+    mutate(disparity = race_stops-race_outcome) %>% 
+    st_transform(4326)
+  
+  return (race_outcomes)
+})
+
+race_outcome_plot <- renderLeaflet({
+  # Creates color grading
+  pal <- colorNumeric(carto_pal(7, "Fall"), 
+                    reverse = FALSE, 
+                    domain = race_outcome_df()$disparity) 
+
+  # Creates map
+  race_disparity <- leaflet() %>% 
+   addProviderTiles("CartoDB.Positron") %>% 
+   addPolygons(data = race_outcome_df(),
+                fillColor = ~pal(disparity),
+                fillOpacity = 0.8,
+                weight = 2, 
+                opacity = 1,
+                color = "white",
+                highlight = highlightOptions(
+                  weight = 3,
+                  fillOpacity = 0.9,
+                  bringToFront = T),
+                popup = paste0("Locality: ", race_outcome_df()$NAMELSAD, "<br>",
+                               "Point Diff: ", round(race_outcome_df()$disparity, 1))) %>%
+    addLegend("topright", pal = pal, values = race_outcome_df()$disparity,
+              title = "Point Difference", opacity = 0.7)
+  return (race_disparity)
+})
+
+race_outcome_plot
+```
+
+## Outcome 10 and text {data-height="550"}
+
+### 10 Counties with the higest disparity in outcome
+
+```{r, echo=FALSE}
+# Subset data to top 5 and bottom 5
+out_disparity_df <- reactive({
+  out_df_sorted <- race_outcome_df()[order(-race_outcome_df()$disparity),] %>% 
+    na.omit()
+  out_df_head <- head(out_df_sorted, 5)
+  out_df_tail <- tail(out_df_sorted, 5)
+  out_df <- rbind(out_df_head, out_df_tail) %>%
+    rbind(out_df_sorted[6:nrow(out_df_sorted)-5,]) %>% 
+    as_tibble() %>%
+    select(c("NAMELSAD", "disparity", "race_stops", "race_outcome")) %>%
+    mutate_if(is.numeric, round, 1)
+  return(out_df)
+})
+
+# Create reactable with bar chart
+disparity_out_ten <- renderReactable({
+  reactable(
+    out_disparity_df(),
+    defaultColDef = colDef(
+              headerStyle = list(background = "#f7f7f8")),
+    columns = list(
+      NAMELSAD = colDef(name = "Locality", minWidth = 100),
+      disparity = colDef(
+        name = "Disparity",
+        defaultSortOrder = "desc",
+        cell = function(value) {
+          label <- paste0(round(value, 1), "%")
+          bar_chart_pos_neg(label, value)
+          },
+          align = "center",
+          minWidth = 400),
+      race_stops = colDef(name = "Stops Race",
+                        format = colFormat(suffix = "%")),
+      race_outcome = colDef(name = "Race Outcome",
+                        format = colFormat(suffix = "%"))),
+    showSortable = TRUE,
+    filterable = TRUE,
+    bordered = TRUE,
+    highlight = TRUE
+    )
+})
+disparity_out_ten
+```
+
+## Locality {data-height="125"}
+
+#### Locality Data
+
+```{r, echo=FALSE}
+selections_output = renderText({
+  res_sels <- paste(input$res_selections, collapse = ', ')
+  year_sels <- paste(input$year_selections, collapse = ' and ')
+  paste("You have selected information on stops of ", tolower(input$race_selections), " individuals in ", input$loc_selections, " who are ", tolower(res_sels), " in ", year_sels, " which resulted in ", tolower(input$outcome_sels))
+})
+selections_output
+```
+
+## Outcomes Graphs
+
+### Race by Outcome in selected locality
+
+```{r, echo=FALSE}
+# Create filtered dataframe based on the residency
+loc_outcome_df <- reactive({
+  # Filter based on selected residency and outcome
+  loc_outcome <- stops %>%
+  filter(locality == input$loc_selections) %>% 
+  filter(year %in% as.vector(input$year_selections)) %>% 
+  filter(residency %in% as.vector(input$res_selections)) %>% 
+  group_by(across(c('action_taken', 'race'))) %>% 
+  summarise(total_count=n()) %>%
+  pivot_wider(names_from=race, values_from=total_count)  %>%
+  replace(is.na(.), 0) %>% 
+  adorn_percentages() %>% 
+  pivot_longer(!action_taken, names_to = "race", values_to='percentage')
+  return (loc_outcome)
+})
+
+loc_race_outcome <- renderPlot({
+  loc_race_outcome_plot <- ggplot(loc_outcome_df(), aes(fill=race, x=action_taken, y=percentage)) +
+     geom_bar(position='stack', stat='identity') +
+    theme_minimal() +
+    labs(x = "Outcome of Stop",
+       y="Percentage") +
+    theme(axis.text.x = element_text(angle = 15))
+  return(loc_race_outcome_plot)
+})
+
+loc_race_outcome
+```
+
+### Outcome by race in selected locality
+
+```{r, echo=FALSE}
+# Create filtered dataframe based on the residency
+loc_race_outcome_df <- reactive({
+  # Filter based on selected residency and outcome
+  loc_race_outcome <- stops %>%
+  filter(locality == input$loc_selections) %>% 
+  filter(year %in% as.vector(input$year_selections)) %>% 
+  filter(residency %in% as.vector(input$res_selections)) %>% 
+  group_by(across(c('action_taken', 'race'))) %>% 
+  summarise(total_count=n()) %>%
+  pivot_wider(names_from=action_taken, values_from=total_count)  %>%
+  replace(is.na(.), 0) %>%
+  adorn_percentages() %>%
+  pivot_longer(!race, names_to = "action_taken", values_to='percentage')
+  return (loc_race_outcome)
+})
+
+loc_outcome_race <- renderPlot({
+  loc_outcome_race_plot <- ggplot(loc_race_outcome_df(), aes(fill=action_taken, x=race, y=percentage)) +
+     geom_bar(position='stack', stat='identity') +
+    theme_minimal() +
+    labs(x = "Race",
+       y="Percentage") +
+    theme(axis.text.x = element_text(angle = 15))
+  return(loc_outcome_race_plot)
+})
+loc_outcome_race
+
+```
+
+## Sunburst
+
+### All Outcomes
+
+```{r, echo=FALSE}
+sunburst_df <- reactive({
+  loc_outcome <- stops %>%
+  filter(locality == input$loc_selections) %>% 
+  filter(year %in% as.vector(input$year_selections)) %>% 
+  filter(residency %in% as.vector(input$res_selections)) %>% 
+  group_by(across(c('action_taken', 'race'))) %>% 
+  summarise(total_count=n()) %>%
+  pivot_wider(names_from=race, values_from=total_count)  %>%
+  replace(is.na(.), 0) %>% 
+  pivot_longer(!action_taken, names_to = "race", values_to='percentage')
+  return(loc_outcome)
+})
+
+sunburst_plot<- renderPlotly({
+  sunburst_DF <- as.sunburstDF(sunburst_df(), value_column = "percentage", add_root = TRUE)
+  plot_ly(data = sunburst_DF,
+          ids = ~ids,
+          labels= ~labels,
+          parents = ~parents,
+          values= ~values,
+          type='sunburst',
+          branchvalues = 'total')
+})
+sunburst_plot
+```
+
+# About {data-orientation="rows"}
+
+## Row
+
+### Authors
+
+Charlie Bruce, Lekha Meheddy, Melinda Wong created this dashboard with help from Professor Michelle Claibourn in LPPS 5720: Public Interest Data at the University of Virginia.
+
+## Row
+
+### Methodology
+
+#### RACE
+
+Although we believe investigating differences in police stops and the outcomes of those stops by race is valuable because the data shows significant differences across racial categorizations, there is intrinsic challenges with aggregation by race and the available data posed methodological challenges.
+
+-   *Two or More Races*: Census data allows respondents to select up to six races while Virginia Community Policing (VCP) data only contains data on single race categorizations. Individuals who identify as two or more races composed, on average, 8.2% of a locality. However, because the method of measuring people of two or more races in the VCP data conflicted with Census data, we did not include a two or more races category in our calculations. s. This also means that we did not split the observations into other racial groups based on which races they identified. We recognize that this is a significant limitation on racial data, but thought it was still valuable to investigate and hope in the future VCP data will include categorizations of more than one race for more robust analysis.
+
+-   *Asian and Pacific Islander*: Census data differentiates between individuals of Asian descent and Pacific Islander/Native Hawaiian but VCP data does not so they were combined into one category again to not skew the data.
+
+-   *Unknown*: 3.9% of all instances of a police stop involved an individual of unknown race. These individuals were removed from the data set to not skew the percentages.
+
+-   *Challenges of using Racial Data*: race is a social concept and perceived racial differences can be perpetuated by research which purports to find differences across racial groups. We recognize that differentiating between racial groups can be incredibly harmful but thought it was important to show that individuals of different races *are* treated differently by the police at this point in time. For more resources on using race in data visualizations, please see below.
+
+    -   Zuberi, T. (2001). Thicker than Blood: How Racial Statistics Lie (NED-New edition). University of Minnesota Press. <http://www.jstor.org/stable/10.5749/j.cttttcnc>
+    -   Ricker, B., Kraak, M.-J., & Engelhardt, Y. (2020). The power of visualization choices: Different images of patterns in space. In M. Engebretsen & H. Kennedy (Eds.), Data Visualization in Society (pp. 407--424). Amsterdam University Press. <https://doi.org/10.2307/j.ctvzgb8c7.30>
+
+#### Calculating disparity
+
+We wanted to show whether certain racial groups were overpoliced ie. they were over represented in police stops. How to do so required methodological choices that are described below:
+
+-   *Comparing VCP data to Census data*: although there were differences in how race was collected within VCP data and Census data which posed challenges as described above, Census data was the highest quality racial data recent data available.
+-   *Choosing Point Difference vs. Percent Difference*: when deciding how to show the difference between % of stops that were a certain race and % of jurisdiction that was a certain race, we were confronted with whether to show that difference as a point difference, simply subtracting one of the values from the other, or a percent difference between the two values to show for example if in one jurisdiction 4% of the population was Black but 8% of the stops were of Black individuals a larger disparity than another jurisdiction where 34% of the population was black and and 38% of stops were of Black individuals. Ultimately, due to the relatively small sample size and small population makeup of some races we decided point difference would be more representative. For example, on average American Indian residents composed 0.5% of a jurisdiction's population but in a jurisdiction with only 50 total stops (which would be normal in many rural counties), a single stop of an American Indian would result in a 150% percent difference but a 1.5 point difference. Especially considering we were allowing users to select residency status and year, we did not want to make disparities seem artificially inflated due to a small number of stops. However, this also means that disparities in races that composed a smaller percent of the population are smaller in raw numbers. This is part of the rationale for only allowing readers to select one race at a time.
+
+#### Missing Data
+
+Isle of Wight County and King and Queeny County did not report data to the Virginia Community Policing Data Portal and are not included in any calculations or visualizations
+
+## Row2 {data-height="750"}
+
+### Resources & Research
+
+#### Virginia Community Policing Act
+
+-   [Virginia Community Policing Act; data collection and reporting requirement. (HB1250), the Richmond Sun](https://www.richmondsunlight.com/bill/2020/hb1250/)
+-   [19 Va. Admin. Code § 30-240-10 Collection and reporting of data State Regulations](https://www.law.cornell.edu/regulations/virginia/19VAC30-240-10)
+-   [Department of Planning and Budget 2020 Fiscal Impact Statement: HB1250](https://lis.virginia.gov/cgi-bin/legp604.exe?201+oth+HB1250F122+PDF)
+-   [Virginia Association of Chiefs of Police Priorities Opposing HB125](https://www.vachiefs.org/files/news/VACP%20Police%20Reform%20Priorities.pdf)
+-   [Loudoun County Legislative Report- Special Session, July 2020 (page 19)](https://loudoun.granicus.com/MetaViewer.php?view_id=86&clip_id=6369&meta_id=180941)
+-   [New Virginia law requires racial questions to be asked at traffic stop, NBC29, July 2020](https://www.nbc29.com/2020/07/01/new-virginia-law-requires-racial-questions-be-asked-traffic-stop/)
+
+#### Policing in Virginia
+
+-   [Video Shows Virginia Man's Death in Custody, New York Times, March 2023](https://www.nytimes.com/2023/03/21/us/irvo-otieno-virginia-police-video.html?campaign_id=190&emc=edit_ufn_20230321&instance_id=88290&nl=from-the-times%C2%AEi_id=182452858&segment_id=128380&te=1&user_id=a0c7fb1b777a52c537fcc65e1ef8b0dc)
+-   [While some call for change after Tyre Nichols's death, Virginia Republicans want to get rid of police reforms, 6News Richmond, January 2023](https://www.wtvr.com/news/local-news/repeal-virginias-police-reform-jan-31-2023)
+-   ["I Almost Quit": Exploring the Prevalence of the Ferguson Effect in Two Small Sized Law Enforcement Agencies in Rural Southcentral Virginia, The Qualitative Report Vol. 24, Iss. 7, (Jul 2019)](https://www.proquest.com/docview/2268536346?pq-origsite=gscholar&fromopenview=true)
+-   [Determined to Be Free, Charlottesville Tomorrow, June 2020](https://www.cvilletomorrow.org/determined-to-be-free/)
+
+#### Policing Data and Reports from Neighboring D.C.
+
+-   [NEAR Act](https://saferstronger.dc.gov/page/near-act-safer-stronger-dc)
+-   [RACIAL DISPARITIES IN STOPS BY THE D.C. METROPOLITAN POLICE DEPARTMENT, ACLU, July 2020](https://www.acludc.org/sites/default/files/2020_06_15_aclu_stops_report_final.pdf)
+-   [Racial Disparities in Stops by the Metropolitan Police Department, ACLU 2021 Data Update](https://search.issuelab.org/resource/racial-disparities-in-stops-by-the-metropolitan-police-department-2020-data-update.html)
+-   [Metropolitan Police Department Stop Data Report](https://mpdc.dc.gov/sites/default/files/dc/sites/mpdc/publication/attachments/Stop%20Data%20Report_september2021_v2.pdf)
+
+#### Research on Policing
+
+-   [Behind the Badge, Pew Research Center](https://www.pewresearch.org/social-trends/2017/01/11/behind-the-badge/)
+-   [The Racial Confidence Gap in Police Performance, Pew Research Center](https://www.pewresearch.org/social-trends/2016/09/29/the-racial-confidence-gap-in-police-performance/#wide-racial-gaps-in-views-of-police-performance)
+-   [Precinct or prejudice? Understanding racial disparities in New York City's stop-and-frisk policy, the Annals of Applied Statistics, March 2016](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-10/issue-1/Precinct-or-prejudice-Understanding-racial-disparities-in-New-York-Citys/10.1214/15-AOAS897.full)
+-   [10 things we know about race and policing in the U.S.](https://www.pewresearch.org/fact-tank/2020/06/03/10-things-we-know-about-race-and-policing-in-the-u-s/)
+-   [Race, Place, and Effective Policing, Annual Review of Sociology, April 2019](https://www.annualreviews.org/doi/pdf/10.1146/annurev-soc-073018-022541)
+
+#### Inspiration from Similar Data Projects
+
+-   [Charlottesville Police, Temporary Detentions from the UVA Equity Center](https://virginiaequitycenter.github.io/cvilleequity_stopandfrisk/#resources)
+-   [Getting Arrested in Charlottesville, Nathan Day](https://www.natedayta.com/2020/06/07/getting-arrested-in-charlottesville/)
